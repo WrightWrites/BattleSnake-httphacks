@@ -24,6 +24,7 @@ HUNGRY_FOOD_WEIGHT = 40       # pull toward food when hungry
 GROWING_FOOD_WEIGHT = 10      # pull toward food when still growing
 AVOID_FOOD_PENALTY = 60       # push away from food when at the growth cap
 TERRITORY_WEIGHT = 1.0        # value of each square we can reach before opponents
+NO_SAFE_EXIT_PENALTY = 350    # cost of a move whose every way out a bigger snake could contest
 
 
 # info is called when you create your Battlesnake on play.battlesnake.com
@@ -37,7 +38,7 @@ def info() -> typing.Dict:
         "author": "wright",  # TODO: Your Battlesnake Username
         "color": "#D01A1A",  # TODO: Choose color
         "head": "orca",  # TODO: Choose head
-        "tail": "skinny-jeans",  # TODO: Choose tail
+        "tail": "small-rattle",  # TODO: Choose tail
     }
 
 
@@ -276,6 +277,23 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 )
                 if room_after < info["length"] and room_after < info["room"]:
                     score += 120 + (info["room"] - room_after)
+
+        # Step 10 - look one turn further: after this move, will we have at least
+        # one way out that a same-size or bigger snake could not also reach in time?
+        # (A snake two or fewer moves from a square can contest it on our next turn.)
+        length_after = my_length + (1 if square in food_squares else 0)
+        exits = open_neighbours(square, blocked | {square}, board_width, board_height)
+        safe_exits = 0
+        for exit_square in exits:
+            contested = any(
+                info["length"] >= length_after
+                and info["distances"].get(exit_square, 9999) <= 2
+                for info in opponent_info
+            )
+            if not contested:
+                safe_exits += 1
+        if safe_exits == 0:
+            score -= NO_SAFE_EXIT_PENALTY
 
         distances = distances_from(square, blocked, board_width, board_height)
 
