@@ -15,6 +15,17 @@ import random
 import typing
 
 
+# Settings you can tune
+GROWTH_CAP_FRACTION = 0.125   # stop growing at this share of the board's squares
+MIN_GROWTH_CAP = 4            # never cap growth below this length
+STAY_LONGEST = False          # keep growing past the cap if an opponent is as long as us
+HUNGRY_HEALTH = 40            # below this health, eating becomes urgent
+HUNGRY_FOOD_WEIGHT = 40       # pull toward food when hungry
+GROWING_FOOD_WEIGHT = 10      # pull toward food when still growing
+AVOID_FOOD_PENALTY = 60       # push away from food when at the growth cap
+TERRITORY_WEIGHT = 1.0        # value of each square we can reach before opponents
+
+
 # info is called when you create your Battlesnake on play.battlesnake.com
 # and controls your Battlesnake's appearance
 # TIP: If you open your Battlesnake URL in a browser you should see this data
@@ -199,21 +210,35 @@ def move(game_state: typing.Dict) -> typing.Dict:
         if not beaten:
             winnable_food.append(square)
 
-    longest_opponent = max((info["length"] for info in opponent_info), default=0)
-    hungry = you["health"] < 40
-    target_food = None
-    if winnable_food:
-        target_food = min(winnable_food, key=lambda square: my_distances[square])
-    elif reachable_food:
-        # Every piece is contested - go for the closest anyway
-        target_food = min(reachable_food, key=lambda square: my_distances[square])
+    # Step 8 - growth plan: how long we want to get depends on the board size.
+    # Small boards get a low cap so we don't outgrow the space and coil into
+    # ourselves; big boards get a high cap so we grow fast early on.
+    board_area = board_width * board_height
+    growth_cap = max(MIN_GROWTH_CAP, int(board_area * GROWTH_CAP_FRACTION))
+    if STAY_LONGEST:
+        # Never settle for being shorter than an opponent - a shorter snake loses
+        # head-to-heads, so keep at least one segment ahead of the longest one
+        longest_opponent = max((info["length"] for info in opponent_info), default=0)
+        growth_cap = max(growth_cap, longest_opponent + 1)
+    at_growth_cap = my_length >= growth_cap
 
-    if hungry:
-        food_weight = 40   # eating is urgent
-    elif my_length >= longest_opponent + 2 and you["health"] > 60:
-        food_weight = 3    # already the biggest - focus on space and attacking
-    else:
-        food_weight = 10   # keep growing
+    # "Hungry" means health is low enough that we must eat now, allowing for the
+    # time it takes to travel to the nearest food
+    nearest_food_distance = min((my_distances[square] for square in reachable_food), default=0)
+    hungry = you["health"] < max(HUNGRY_HEALTH, nearest_food_distance * 2 + 10)
+
+    # Only go after food when we still want to grow, or when we need the health
+    target_food = None
+    if hungry or not at_growth_cap:
+        if winnable_food:
+            target_food = min(winnable_food, key=lambda square: my_distances[square])
+        elif reachable_food:
+            # Every piece is contested - go for the closest anyway
+            target_food = min(reachable_food, key=lambda square: my_distances[square])
+
+    food_weight = HUNGRY_FOOD_WEIGHT if hungry else GROWING_FOOD_WEIGHT
+    avoid_food = at_growth_cap and not hungry
+    food_squares = {(piece["x"], piece["y"]) for piece in game_state['board']['food']}
 
     # Score every safe move and pick the best
     scores = {}
@@ -252,10 +277,22 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 if room_after < info["length"] and room_after < info["room"]:
                     score += 120 + (info["room"] - room_after)
 
-        # Move toward the chosen food
+        distances = distances_from(square, blocked, board_width, board_height)
+
+        # Step 9 - territory: count the squares we would reach before any opponent,
+        # so we spread into open space and wall opponents out of it
+        territory = 0
+        for reachable_square, distance in distances.items():
+            if all(distance + 1 < info["distances"].get(reachable_square, 9999)
+                   for info in opponent_info):
+                territory += 1
+        score += TERRITORY_WEIGHT * territory
+
+        # Move toward the chosen food, or steer around food when we're at the cap
         if target_food is not None:
-            distances = distances_from(square, blocked, board_width, board_height)
             score -= food_weight * distances.get(target_food, board_width + board_height)
+        elif avoid_food and square in food_squares:
+            score -= AVOID_FOOD_PENALTY
 
         scores[candidate] = score
 
