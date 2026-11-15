@@ -80,8 +80,8 @@ RETREAT_TERRITORY_WEIGHT = 5.0  # value of each square we reach first while retr
 
 # champion.py settings
 VARIANT_NAME = "champion"
-DEFAULT_PORT = "8010"         # port this file listens on unless PORT is set
-SNAKE_COLOR = "#00C2A8"
+DEFAULT_PORT = "8000"         # port this file listens on unless PORT is set
+SNAKE_COLOR = "#D01A1A"
 HUNT_STYLE = "trapper"        # "trapper": hunt one vulnerable snake at any stage; "duel": chase and squeeze only with one opponent left; "off"
 HUNT_LEAD = 2                 # "duel" style: only hunt a snake we out-length by at least this much
 DUEL_HUNT_WEIGHT = 8          # "duel" style: pull toward the squares next to the opponent's head
@@ -114,7 +114,20 @@ def start(game_state: typing.Dict):
 
 # end is called when your Battlesnake finishes a game
 def end(game_state: typing.Dict):
-    print("GAME OVER\n")
+    survivors = game_state["board"]["snakes"]
+    my_id = game_state["you"]["id"]
+
+    if not survivors:
+        result = "draw (no snakes left)"
+    elif len(survivors) == 1:
+        winner = survivors[0]
+        tag = " (that's us!)" if winner["id"] == my_id else ""
+        result = f"{winner['name']}{tag}"
+    else:
+        # Game ended with several snakes alive (e.g. a turn limit)
+        result = "no single winner: " + ", ".join(s["name"] for s in survivors)
+
+    print(f"GAME OVER - Winner: {result}\n")
 
 
 # flood_fill counts how many open squares can be reached from a starting square

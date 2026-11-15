@@ -13,6 +13,7 @@
 import collections
 import random
 import typing
+import os
 from datetime import datetime
 # from waitress import serve
 # serve(app, host=host, port=port, threads=8)
@@ -38,6 +39,8 @@ ESCAPE_SEARCH_NODES = 3000    # limit on the escape search, to stay well inside 
 STARVING_MARGIN = 10          # starving = health no more than this above the distance to the nearest food
 RETREAT_TERRITORY_WEIGHT = 5.0  # value of each square we reach first while retreating from a lost food race
 
+VARIANT_NAME = "main"
+DEFAULT_PORT = "8001"  
 
 # info is called when you create your Battlesnake on play.battlesnake.com
 # and controls your Battlesnake's appearance
@@ -516,4 +519,6 @@ def move(game_state: typing.Dict) -> typing.Dict:
 if __name__ == "__main__":
     from server import run_server
 
+    os.environ.setdefault("PORT", DEFAULT_PORT)
+    print(f"Variant: {VARIANT_NAME}")
     run_server({"info": info, "start": start, "move": move, "end": end})
