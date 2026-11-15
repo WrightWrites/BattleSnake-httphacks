@@ -13,6 +13,9 @@
 import collections
 import random
 import typing
+from datetime import datetime
+# from waitress import serve
+# serve(app, host=host, port=port, threads=8)
 
 
 # Settings you can tune
@@ -25,6 +28,15 @@ GROWING_FOOD_WEIGHT = 10      # pull toward food when still growing
 AVOID_FOOD_PENALTY = 60       # push away from food when at the growth cap
 TERRITORY_WEIGHT = 1.0        # value of each square we can reach before opponents
 NO_SAFE_EXIT_PENALTY = 350    # cost of a move whose every way out a bigger snake could contest
+SEALED_CORRIDOR_PENALTY = 600 # cost of entering a corridor an opponent can seal before we get out
+CORRIDOR_LOOKAHEAD = 8        # how many squares along a corridor to check
+FOOD_RACE_RANGE = 3           # how close a contested piece of food must be to back away from it
+FOOD_RACE_PENALTY = 150       # cost of closing in on food a same-size or bigger snake reaches first
+TRAPPED_PENALTY = 400         # cost of a move into a tight space with no path that lasts until it opens
+ESCAPE_DEPTH_CAP = 24         # a path this long counts as survived
+ESCAPE_SEARCH_NODES = 3000    # limit on the escape search, to stay well inside the time budget
+STARVING_MARGIN = 10          # starving = health no more than this above the distance to the nearest food
+RETREAT_TERRITORY_WEIGHT = 5.0  # value of each square we reach first while retreating from a lost food race
 
 
 # info is called when you create your Battlesnake on play.battlesnake.com
@@ -90,6 +102,68 @@ def distances_from(start_square, blocked, board_width, board_height) -> typing.D
                 distances[neighbour] = distances[square] + 1
                 queue.append(neighbour)
     return distances
+
+
+# escape_search looks for a way to stay alive inside a tight space. It tries
+# paths from start_square that use the space as fully as possible, and counts a
+# path as an escape when it reaches a square that a snake's body will have left
+# by the time we get there (usually our own tail area opening up).
+# Returns 1.0 when an escape exists, otherwise the share of the needed moves the
+# longest path survives.
+def escape_search(start_square, region, free_at, own_squares, food_squares,
+                  my_length, board_width, board_height) -> float:
+    target_depth = min(ESCAPE_DEPTH_CAP, my_length)
+    best = [1]
+    nodes = [0]
+    visited = {start_square}
+
+    def explore(square, move_number, eaten):
+        # move_number is the move that put us on `square` (1 = the move being scored)
+        if move_number > best[0]:
+            best[0] = move_number
+        if best[0] >= target_depth:
+            return True
+        nodes[0] += 1
+        if nodes[0] > ESCAPE_SEARCH_NODES:
+            return False
+        x, y = square
+        options = []
+        for neighbour in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            nx, ny = neighbour
+            if nx < 0 or nx >= board_width or ny < 0 or ny >= board_height:
+                continue
+            if neighbour in visited:
+                continue
+            if neighbour in free_at:
+                # A body square: we can only step in once that snake has moved off it.
+                # Our own body clears one move later for each piece of food we eat.
+                opens = free_at[neighbour] + (eaten if neighbour in own_squares else 0)
+                if move_number + 1 >= opens:
+                    return True   # the space has opened up - we are out
+                continue
+            if neighbour not in region:
+                continue
+            options.append(neighbour)
+        # Try the tightest squares first, so the path hugs the edges and wastes no space
+        def tightness(option):
+            ox, oy = option
+            free_sides = 0
+            for side in ((ox + 1, oy), (ox - 1, oy), (ox, oy + 1), (ox, oy - 1)):
+                if side in region and side not in visited and side not in free_at:
+                    free_sides += 1
+            return free_sides
+        options.sort(key=tightness)
+        for option in options:
+            visited.add(option)
+            escaped = explore(option, move_number + 1, eaten + (1 if option in food_squares else 0))
+            visited.discard(option)
+            if escaped:
+                return True
+        return False
+
+    if explore(start_square, 1, 1 if start_square in food_squares else 0):
+        return 1.0
+    return best[0] / target_depth
 
 
 # move is called on every turn and returns your next move
@@ -194,6 +268,7 @@ def move(game_state: typing.Dict) -> typing.Dict:
     my_distances = distances_from(my_head_square, blocked, board_width, board_height)
     reachable_food = []
     winnable_food = []
+    dangerous_food = []   # food a same-size or bigger snake reaches as soon as we do
     for piece in game_state['board']['food']:
         square = (piece["x"], piece["y"])
         if square not in my_distances:
@@ -210,6 +285,13 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 beaten = True
         if not beaten:
             winnable_food.append(square)
+        # Racing a same-size or bigger snake to food ends in a head-to-head we lose
+        if any(
+            info["length"] >= my_length
+            and info["distances"].get(square, 9999) <= my_distances[square]
+            for info in opponent_info
+        ):
+            dangerous_food.append(square)
 
     # Step 8 - growth plan: how long we want to get depends on the board size.
     # Small boards get a low cap so we don't outgrow the space and coil into
@@ -222,24 +304,65 @@ def move(game_state: typing.Dict) -> typing.Dict:
         longest_opponent = max((info["length"] for info in opponent_info), default=0)
         growth_cap = max(growth_cap, longest_opponent + 1)
     at_growth_cap = my_length >= growth_cap
+    if len(opponents) == 1:
+        # Down to one opponent: lift the cap, since the board has room again and
+        # the longer snake wins the head-to-heads that decide a duel
+        at_growth_cap = False
 
     # "Hungry" means health is low enough that we must eat now, allowing for the
     # time it takes to travel to the nearest food
     nearest_food_distance = min((my_distances[square] for square in reachable_food), default=0)
     hungry = you["health"] < max(HUNGRY_HEALTH, nearest_food_distance * 2 + 10)
 
+    # "Starving" means backing off from the nearest food now would mean dying
+    # before we could come back for it
+    starving = bool(reachable_food) and you["health"] <= nearest_food_distance + STARVING_MARGIN
+
     # Only go after food when we still want to grow, or when we need the health
     target_food = None
     if hungry or not at_growth_cap:
         if winnable_food:
             target_food = min(winnable_food, key=lambda square: my_distances[square])
-        elif reachable_food:
-            # Every piece is contested - go for the closest anyway
-            target_food = min(reachable_food, key=lambda square: my_distances[square])
+        else:
+            # Every piece is contested - go for the closest one that isn't a race
+            # against a same-size or bigger snake. Only risk that race when starving.
+            fallback_food = [f for f in reachable_food if f not in dangerous_food]
+            if not fallback_food and starving:
+                fallback_food = reachable_food
+            if fallback_food:
+                target_food = min(fallback_food, key=lambda square: my_distances[square])
+
+    # Retreat: we want food, but the only food on offer is a race we would lose.
+    # Back off into the emptiest part of the board and gamble on food spawning
+    # there, by valuing the squares we can reach before any opponent much more.
+    retreating = (
+        target_food is None
+        and bool(dangerous_food)
+        and not starving
+        and (hungry or not at_growth_cap)
+    )
 
     food_weight = HUNGRY_FOOD_WEIGHT if hungry else GROWING_FOOD_WEIGHT
     avoid_food = at_growth_cap and not hungry
     food_squares = {(piece["x"], piece["y"]) for piece in game_state['board']['food']}
+
+    # For the trapped check: the move number on which each body square opens up
+    # (1 = this turn's move), and the squares an opponent's head could reach
+    # within two moves, which we assume it could close off
+    free_at = {}
+    own_squares = set()
+    for snake in game_state['board']['snakes']:
+        snake_length = len(snake["body"])
+        for index, segment in enumerate(snake["body"]):
+            body_square = (segment["x"], segment["y"])
+            free_at[body_square] = max(free_at.get(body_square, 0), snake_length - index)
+            if snake["id"] == you["id"]:
+                own_squares.add(body_square)
+    closable = set()
+    for info in opponent_info:
+        for reachable_square, their_distance in info["distances"].items():
+            if 0 < their_distance <= 2:
+                closable.add(reachable_square)
 
     # Score every safe move and pick the best
     scores = {}
@@ -278,6 +401,20 @@ def move(game_state: typing.Dict) -> typing.Dict:
                 if room_after < info["length"] and room_after < info["room"]:
                     score += 120 + (info["room"] - room_after)
 
+        # Step 14 - trapped check: if the space we would be left in (assuming nearby
+        # opponents close the gaps they can reach) is smaller than our body, search
+        # for a path that uses that space fully and lasts until our tail area opens
+        # up. Moves with no such path are penalised by how soon they run out.
+        escape_found = False
+        sealed_region = set(distances_from(square, blocked | closable, board_width, board_height))
+        if len(sealed_region) < my_length:
+            survival = escape_search(square, sealed_region, free_at, own_squares, food_squares,
+                                     my_length, board_width, board_height)
+            score -= TRAPPED_PENALTY * (1 - survival)
+            # With a sure way out through our own space, being sealed in is survivable,
+            # so the two checks below don't need to warn us off this move
+            escape_found = survival >= 1.0
+
         # Step 10 - look one turn further: after this move, will we have at least
         # one way out that a same-size or bigger snake could not also reach in time?
         # (A snake two or fewer moves from a square can contest it on our next turn.)
@@ -292,8 +429,38 @@ def move(game_state: typing.Dict) -> typing.Dict:
             )
             if not contested:
                 safe_exits += 1
-        if safe_exits == 0:
+        if safe_exits == 0 and not escape_found:
             score -= NO_SAFE_EXIT_PENALTY
+
+        # Step 11 - pin check: if this move starts down a one-square-wide corridor
+        # (for example between a wall and another snake's body), follow it to where
+        # it opens out. If an opponent can get into the corridor ahead of us, it can
+        # seal us in, so take another way out while we still have one.
+        walked = {square}
+        current = square
+        sealed_in = False
+        for steps in range(1, CORRIDOR_LOOKAHEAD + 1):
+            onward = [
+                n for n in open_neighbours(current, blocked | walked, board_width, board_height)
+                if flood_fill(n, blocked | walked, board_width, board_height) >= my_length
+            ]
+            if len(onward) != 1:
+                break   # it opens out (or dead-ends, which the flood fill already punishes)
+            current = onward[0]
+            walked.add(current)
+            our_arrival = steps + 1
+            for info in opponent_info:
+                their_arrival = info["distances"].get(current)
+                if their_arrival is None:
+                    continue
+                if their_arrival < our_arrival or (
+                    their_arrival == our_arrival and info["length"] > length_after
+                ):
+                    sealed_in = True
+            if sealed_in:
+                break
+        if sealed_in and not escape_found:
+            score -= SEALED_CORRIDOR_PENALTY
 
         distances = distances_from(square, blocked, board_width, board_height)
 
@@ -304,7 +471,7 @@ def move(game_state: typing.Dict) -> typing.Dict:
             if all(distance + 1 < info["distances"].get(reachable_square, 9999)
                    for info in opponent_info):
                 territory += 1
-        score += TERRITORY_WEIGHT * territory
+        score += (RETREAT_TERRITORY_WEIGHT if retreating else TERRITORY_WEIGHT) * territory
 
         # Move toward the chosen food, or steer around food when we're at the cap
         if target_food is not None:
@@ -312,12 +479,23 @@ def move(game_state: typing.Dict) -> typing.Dict:
         elif avoid_food and square in food_squares:
             score -= AVOID_FOOD_PENALTY
 
+        # Step 12 - food race check: when a same-size or bigger snake will reach a
+        # nearby piece of food as soon as we would, back away from it early instead
+        # of closing in and meeting that snake head-on
+        if not starving:
+            for food_square in dangerous_food:
+                if (my_distances[food_square] <= FOOD_RACE_RANGE
+                        and distances.get(food_square, 9999) < my_distances[food_square]):
+                    score -= FOOD_RACE_PENALTY
+                    break
+
         scores[candidate] = score
 
     best_score = max(scores.values())
     next_move = random.choice([m for m in safe_moves if scores[m] >= best_score - 0.001])
 
-    print(f"MOVE {game_state['turn']}: {next_move}")
+    print(f"{datetime.now():%H:%M:%S} {game_state['game']['id'][:8]} MOVE {game_state['turn']}: {next_move}")
+    
     return {"move": next_move}
 
 
