@@ -61,7 +61,20 @@ def start(game_state: typing.Dict):
 
 # end is called when your Battlesnake finishes a game
 def end(game_state: typing.Dict):
-    print("GAME OVER\n")
+    survivors = game_state["board"]["snakes"]
+    my_id = game_state["you"]["id"]
+
+    if not survivors:
+        result = "draw (no snakes left)"
+    elif len(survivors) == 1:
+        winner = survivors[0]
+        tag = " (that's us!)" if winner["id"] == my_id else ""
+        result = f"{winner['name']}{tag}"
+    else:
+        # Game ended with several snakes alive (e.g. a turn limit)
+        result = "no single winner: " + ", ".join(s["name"] for s in survivors)
+
+    print(f"GAME OVER - Winner: {result}\n")
 
 
 # flood_fill counts how many open squares can be reached from a starting square
