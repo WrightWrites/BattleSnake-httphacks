@@ -10,6 +10,7 @@
 # To get you started we've included code to prevent your Battlesnake from moving backwards.
 # For more info see docs.battlesnake.com
 
+import collections
 import random
 import typing
 
@@ -24,8 +25,8 @@ def info() -> typing.Dict:
         "apiversion": "1",
         "author": "wright",  # TODO: Your Battlesnake Username
         "color": "#D01A1A",  # TODO: Choose color
-        "head": "default",  # TODO: Choose head
-        "tail": "default",  # TODO: Choose tail
+        "head": "orca",  # TODO: Choose head
+        "tail": "skinny-jeans",  # TODO: Choose tail
     }
 
 
@@ -37,6 +38,46 @@ def start(game_state: typing.Dict):
 # end is called when your Battlesnake finishes a game
 def end(game_state: typing.Dict):
     print("GAME OVER\n")
+
+
+# flood_fill counts how many open squares can be reached from a starting square
+def flood_fill(start_square, blocked, board_width, board_height) -> int:
+    seen = {start_square}
+    to_visit = [start_square]
+    while to_visit:
+        x, y = to_visit.pop()
+        for neighbour in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            nx, ny = neighbour
+            if nx < 0 or nx >= board_width or ny < 0 or ny >= board_height:
+                continue
+            if neighbour in blocked or neighbour in seen:
+                continue
+            seen.add(neighbour)
+            to_visit.append(neighbour)
+    return len(seen)
+
+
+# open_neighbours lists the squares next to a square that are on the board and not blocked
+def open_neighbours(square, blocked, board_width, board_height) -> typing.List:
+    x, y = square
+    result = []
+    for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+        if 0 <= nx < board_width and 0 <= ny < board_height and (nx, ny) not in blocked:
+            result.append((nx, ny))
+    return result
+
+
+# distances_from works out how many moves away each reachable square is from a start square
+def distances_from(start_square, blocked, board_width, board_height) -> typing.Dict:
+    distances = {start_square: 0}
+    queue = collections.deque([start_square])
+    while queue:
+        square = queue.popleft()
+        for neighbour in open_neighbours(square, blocked, board_width, board_height):
+            if neighbour not in distances:
+                distances[neighbour] = distances[square] + 1
+                queue.append(neighbour)
+    return distances
 
 
 # move is called on every turn and returns your next move
@@ -105,20 +146,121 @@ def move(game_state: typing.Dict) -> typing.Dict:
             safe_moves.append(move)
 
     if len(safe_moves) == 0:
-        print(f"MOVE {game_state['turn']}: No safe moves detected! Moving down")
-        return {"move": "down"}
+        print(f"MOVE {game_state['turn']}: No safe moves detected! Moving left")
+        return {"move": "left"}
 
-    # Choose a random move from the safe ones
-    next_move = random.choice(safe_moves)
+    you = game_state["you"]
+    my_length = len(you["body"])
+    my_head_square = (my_head["x"], my_head["y"])
+    opponents = [s for s in game_state['board']['snakes'] if s["id"] != you["id"]]
 
-    # Step 4 - head for the nearest food, using only safe moves
-    food = game_state['board']['food']
-    if food:
-        def distance(a, b):
-            return abs(a["x"] - b["x"]) + abs(a["y"] - b["y"])
+    # Squares occupied by snake bodies
+    blocked = set()
+    for snake in game_state['board']['snakes']:
+        # A snake's tail square frees up next turn, so it doesn't count as blocked
+        # (after eating, the tail is doubled up and the square stays blocked)
+        for segment in snake["body"][:-1]:
+            blocked.add((segment["x"], segment["y"]))
 
-        nearest = min(food, key=lambda f: distance(my_head, f))
-        next_move = min(safe_moves, key=lambda m: distance(next_squares[m], nearest))
+    # What each opponent can do next: where its head could go, how much room it has,
+    # and how far it is from every square
+    opponent_info = []
+    for opponent in opponents:
+        head = (opponent["body"][0]["x"], opponent["body"][0]["y"])
+        options = open_neighbours(head, blocked, board_width, board_height)
+        room = max((flood_fill(o, blocked, board_width, board_height) for o in options), default=0)
+        opponent_info.append({
+            "length": len(opponent["body"]),
+            "options": options,
+            "room": room,
+            "distances": distances_from(head, blocked, board_width, board_height),
+        })
+
+    # Step 4 - choose which food to go for, skipping food another snake would win.
+    # A snake wins a piece of food if it gets there first, or arrives at the same
+    # time and is at least as long as us (it would win the head-to-head).
+    my_distances = distances_from(my_head_square, blocked, board_width, board_height)
+    reachable_food = []
+    winnable_food = []
+    for piece in game_state['board']['food']:
+        square = (piece["x"], piece["y"])
+        if square not in my_distances:
+            continue
+        reachable_food.append(square)
+        beaten = False
+        for info in opponent_info:
+            their_distance = info["distances"].get(square)
+            if their_distance is None:
+                continue
+            if their_distance < my_distances[square]:
+                beaten = True
+            elif their_distance == my_distances[square] and info["length"] >= my_length:
+                beaten = True
+        if not beaten:
+            winnable_food.append(square)
+
+    longest_opponent = max((info["length"] for info in opponent_info), default=0)
+    hungry = you["health"] < 40
+    target_food = None
+    if winnable_food:
+        target_food = min(winnable_food, key=lambda square: my_distances[square])
+    elif reachable_food:
+        # Every piece is contested - go for the closest anyway
+        target_food = min(reachable_food, key=lambda square: my_distances[square])
+
+    if hungry:
+        food_weight = 40   # eating is urgent
+    elif my_length >= longest_opponent + 2 and you["health"] > 60:
+        food_weight = 3    # already the biggest - focus on space and attacking
+    else:
+        food_weight = 10   # keep growing
+
+    # Score every safe move and pick the best
+    scores = {}
+    for candidate in safe_moves:
+        square = (next_squares[candidate]["x"], next_squares[candidate]["y"])
+        score = 0.0
+
+        # Step 5 - flood fill: avoid moves into a space too small to fit our body
+        room = flood_fill(square, blocked, board_width, board_height)
+        roomy = room >= my_length
+        if not roomy:
+            score -= 1000 * (1 - room / my_length)
+        score += room * 0.05
+
+        # Step 6 - head-to-head: stay away from squares a same-size or bigger snake
+        # could move its head into; go for squares a smaller snake could move into,
+        # but only when the move leaves us enough room to not get stuck
+        for info in opponent_info:
+            if square in info["options"]:
+                if info["length"] >= my_length:
+                    score -= 500
+                elif roomy:
+                    # The fewer choices the smaller snake has, the more likely the kill
+                    score += 300 / len(info["options"])
+
+        # Step 7 - trapping: reward moves that put our body across an opponent's
+        # way out, leaving it less room than its own length
+        if roomy:
+            blocked_after = blocked | {square}
+            for info in opponent_info:
+                room_after = max(
+                    (flood_fill(o, blocked_after, board_width, board_height)
+                     for o in info["options"] if o != square),
+                    default=0,
+                )
+                if room_after < info["length"] and room_after < info["room"]:
+                    score += 120 + (info["room"] - room_after)
+
+        # Move toward the chosen food
+        if target_food is not None:
+            distances = distances_from(square, blocked, board_width, board_height)
+            score -= food_weight * distances.get(target_food, board_width + board_height)
+
+        scores[candidate] = score
+
+    best_score = max(scores.values())
+    next_move = random.choice([m for m in safe_moves if scores[m] >= best_score - 0.001])
 
     print(f"MOVE {game_state['turn']}: {next_move}")
     return {"move": next_move}
